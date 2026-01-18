@@ -60,24 +60,29 @@ def pil_to_base64(image: Image.Image) -> str:
 
 
 # --- 2. AI 核心逻辑 ---
-def grade_with_qwen(image: Image.Image, max_score: int, api_key: str) -> GradeResult:
+def grade_with_qwen(image: Image.Image, current_max_score: int, api_key: str) -> GradeResult:
     client = OpenAI(api_key=api_key, base_url="https://dashscope.aliyuncs.com/compatible-mode/v1")
     base64_img = pil_to_base64(image)
 
     prompt = f"""
-    你是严厉的英语老师。批改这张作业，满分 {max_score}。
+    你是严厉的英语阅卷老师。
+    用户设定这张图片的总分值为：【{current_max_score} 分】。
 
-    任务：
-    1. 找出拼写/语法错误。
-    2. "box"坐标必须精确框住错误单词。
-    3. 若无错误，errors为空。
+    图片中可能包含一道大题，也可能包含多个小题。
 
-    输出JSON：
+    【任务要求】
+    1. **分值权重**：以 {current_max_score} 分为满分上限。如果题目旁标有小分值，请参考该权重；若无，则按错误严重程度扣分。
+    2. **精准定位**："box"坐标必须精确框住错误的单词。
+    3. **错误描述**：请指明错误类型和位置（如"Q1: 拼写错误"）。
+
+    【输出 JSON】
     {{
-        "score": 整数,
-        "short_comment": "简评(中文)",
-        "errors": [ {{"description": "错误说明", "box": [x1, y1, x2, y2]}} ],
-        "analysis_md": "Markdown解析"
+        "score": 整数 (最终得分),
+        "short_comment": "简评(中文, 20字内)",
+        "errors": [ 
+            {{"description": "Q1: have应为has", "box": [x1, y1, x2, y2]}}
+        ],
+        "analysis_md": "Markdown格式分析"
     }}
     注意：box基于1000x1000坐标系。
     """
@@ -97,13 +102,13 @@ def grade_with_qwen(image: Image.Image, max_score: int, api_key: str) -> GradeRe
         error_list = [ErrorItem(**e) for e in data.get("errors", [])]
         return GradeResult(
             score=int(data.get("score", 0)),
-            max_score=max_score,
+            max_score=current_max_score,
             short_comment=data.get("short_comment", "已批改"),
             errors=error_list,
             analysis_md=data.get("analysis_md", "")
         )
     except Exception as e:
-        return GradeResult(0, max_score, "Error", [], f"错误: {str(e)}")
+        return GradeResult(0, current_max_score, "Error", [], f"错误: {str(e)}")
 
 
 # --- 3. 绘图逻辑 ---
@@ -137,101 +142,112 @@ def draw_result(image: Image.Image, result: GradeResult) -> Image.Image:
     return Image.alpha_composite(img_draw, overlay).convert("RGB")
 
 
-# --- 4. 主程序流程 ---
+# --- 4. 主程序 ---
 def main():
     st.set_page_config(page_title="AI阅卷", layout="centered", initial_sidebar_state="collapsed")
 
-    # 初始化 Session State
+    # Session 初始化
     if "page" not in st.session_state: st.session_state.page = "setup"
     if "api_key" not in st.session_state: st.session_state.api_key = ""
-    if "max_score" not in st.session_state: st.session_state.max_score = 100
+    # 核心分值变量
+    if "current_score_setting" not in st.session_state: st.session_state.current_score_setting = 100
+    # 锁定状态变量
+    if "score_locked" not in st.session_state: st.session_state.score_locked = False
 
     # ---------------------------------------------------------
-    # 页面 1: 设置页 (解决侧边栏看不到的问题)
+    # 页面 1: 初始配置
     # ---------------------------------------------------------
     if st.session_state.page == "setup":
         st.markdown("## 🤖 AI 阅卷老师")
-        st.info("首次使用，请配置以下信息：")
-
         with st.container(border=True):
-            # 使用 form 避免每次输入都刷新，必须点按钮才提交
-            with st.form("settings_form"):
-                key_input = st.text_input("1. 输入阿里云 API Key",
-                                          value=st.session_state.api_key,
-                                          type="password",
-                                          placeholder="sk-xxxxxxxx")
-
-                score_input = st.number_input("2. 设定试卷满分",
-                                              min_value=1, max_value=200,
-                                              value=st.session_state.max_score, step=1)
-
-                # 显眼的提交按钮
-                submitted = st.form_submit_button("🚀 确认并开始", use_container_width=True, type="primary")
-
+            with st.form("login_form"):
+                key_input = st.text_input("请输入阿里云 API Key", value=st.session_state.api_key, type="password")
+                submitted = st.form_submit_button("🚀 确认并进入系统", use_container_width=True, type="primary")
                 if submitted:
                     if not key_input:
-                        st.error("请输入 API Key 才能继续！")
+                        st.error("Key 不能为空")
                     else:
                         st.session_state.api_key = key_input
-                        st.session_state.max_score = score_input
-                        st.session_state.page = "scan"  # 切换到拍摄页
+                        st.session_state.page = "scan"
                         st.rerun()
 
     # ---------------------------------------------------------
-    # 页面 2: 沉浸式拍摄页 (应用暴力全屏 CSS)
+    # 页面 2: 拍摄页 (新增：锁定逻辑)
     # ---------------------------------------------------------
     elif st.session_state.page == "scan":
-        # ⚠️ 只有在拍摄页才注入这个 CSS，防止影响设置页
         st.markdown("""
             <style>
-            /* 隐藏顶部Header */
             header {visibility: hidden;} 
-            /* 移除页面边距 */
             .main .block-container {
-                padding: 0rem !important;
+                padding: 10px !important; 
                 max-width: 100%;
             }
-            /* 摄像头全屏 */
             [data-testid="stCameraInput"] {
                 width: 100% !important;
-                height: 85vh !important;
-                margin-bottom: 0px !important;
+                height: 75vh !important;
+                margin-top: 5px;
             }
             [data-testid="stCameraInput"] video {
                 height: 100% !important;
                 object-fit: cover !important;
-                border-radius: 0px 0px 20px 20px;
+                border-radius: 15px;
             }
-            /* 底部按钮区域美化 */
-            .stButton button {
-                border-radius: 25px;
-                height: 3rem;
-                font-weight: bold;
-            }
+            .stButton button { border-radius: 25px; height: 3rem; font-weight: bold; }
+            /* 调整Toggle样式，使其更紧凑 */
+            .stCheckbox label { font-weight: bold; color: #555; }
             </style>
         """, unsafe_allow_html=True)
 
-        # 1. 摄像头区域
-        shot = st.camera_input(" ", label_visibility="collapsed")
+        # --- 顶部控制区 ---
+        c1, c2, c3 = st.columns([1.2, 2, 1.2])  # 调整比例
 
-        # 2. 相册上传区域 (折叠)
-        with st.expander("🖼️ 从相册选择图片", expanded=False):
+        with c1:
+            st.markdown("#### 📸 拍题")
+
+        with c2:
+            # 分值输入框：如果锁定状态为True，则禁用(disabled=True)
+            new_score = st.number_input(
+                "满分",
+                value=st.session_state.current_score_setting,
+                min_value=1, max_value=200, step=1,
+                label_visibility="collapsed",
+                disabled=st.session_state.score_locked,  # 关键：根据锁定状态禁用
+                key="score_input_box"
+            )
+            # 如果没锁定，实时更新Session
+            if not st.session_state.score_locked:
+                st.session_state.current_score_setting = new_score
+
+        with c3:
+            # 锁定开关
+            is_locked = st.checkbox("🔒锁定", value=st.session_state.score_locked, key="lock_checkbox")
+            st.session_state.score_locked = is_locked
+
+        # 状态提示
+        if st.session_state.score_locked:
+            st.caption(f"🔒 分值已锁定为 **{st.session_state.current_score_setting} 分** (批量批改模式)")
+        else:
+            st.caption(f"🔓 当前满分 **{st.session_state.current_score_setting} 分** (可随时修改)")
+
+        # 摄像头与相册
+        shot = st.camera_input(" ", label_visibility="collapsed")
+        with st.expander("🖼️ 从相册选择", expanded=False):
             upload = st.file_uploader(" ", type=["jpg", "png", "jpeg"], label_visibility="collapsed")
 
-        # 3. 返回设置按钮 (放在最下面)
-        if st.button("⚙️ 修改 Key 或 分数"):
+        # 底部功能
+        if st.button("⬅️ 设置 Key"):
             st.session_state.page = "setup"
             st.rerun()
 
         # 处理逻辑
         input_img = shot if shot else upload
         if input_img:
-            # 防止重复处理
             if "last_processed" not in st.session_state or st.session_state.last_processed != input_img.name:
                 st.session_state.last_processed = input_img.name
-                with st.spinner("⚡ 正在分析..."):
+                # 使用 current_score_setting，无论是否锁定，这个值都是最新的
+                with st.spinner(f"⚡ 正在批改 (满分: {st.session_state.current_score_setting})..."):
                     st.session_state.clean_image = process_image_for_ai(input_img)
-                    st.session_state.page = "review"  # 切换到结果页
+                    st.session_state.page = "review"
                     st.rerun()
 
     # ---------------------------------------------------------
@@ -244,7 +260,7 @@ def main():
                 st.session_state.clean_image):
             st.session_state.current_img_id = id(st.session_state.clean_image)
             with st.status("AI 阅卷中...", expanded=True) as status:
-                res = grade_with_qwen(st.session_state.clean_image, st.session_state.max_score,
+                res = grade_with_qwen(st.session_state.clean_image, st.session_state.current_score_setting,
                                       st.session_state.api_key)
                 st.session_state.grade_result = res
                 st.session_state.final_image = draw_result(st.session_state.clean_image, res)
@@ -261,15 +277,14 @@ def main():
 
         st.caption(st.session_state.grade_result.analysis_md)
 
-        col1, col2 = st.columns([1, 1])
-        with col1:
-            if st.button("📸 下一位", type="primary", use_container_width=True):
-                st.session_state.page = "scan"
-                st.rerun()
-        with col2:
-            if st.button("⚙️ 设置", use_container_width=True):
-                st.session_state.page = "setup"
-                st.rerun()
+        # 下一题逻辑
+        if st.button("📸 下一位同学 (分值不变)", type="primary", use_container_width=True):
+            # 注意：这里我们只清除图片数据，不清除 score_locked 和 current_score_setting
+            # 这样回到 Scan 页面时，锁定状态和分数依然保留
+            for k in ["clean_image", "grade_result", "final_image", "last_processed", "current_img_id"]:
+                if k in st.session_state: del st.session_state[k]
+            st.session_state.page = "scan"
+            st.rerun()
 
 
 if __name__ == "__main__":

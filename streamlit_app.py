@@ -26,12 +26,13 @@ class GradeResult:
     analysis_md: str
 
 
+# 核心修复：增加防崩溃护盾的字体加载函数
 @st.cache_resource
 def load_font(size: int):
     font_url = "https://github.com/google/fonts/raw/main/ofl/notosanssc/NotoSansSC-Bold.ttf"
     local_font = "NotoSansSC-Bold.ttf"
 
-    # 1. 如果文件不存在，尝试下载
+    # 1. 如果本地没有，尝试下载
     if not os.path.exists(local_font):
         try:
             headers = {'User-Agent': 'Mozilla/5.0'}
@@ -39,23 +40,23 @@ def load_font(size: int):
             if r.status_code == 200:
                 with open(local_font, 'wb') as f:
                     f.write(r.content)
-        except:
-            pass  # 下载失败就忽略
+        except Exception:
+            pass  # 下载失败忽略，后续会处理
 
-    # 2. 尝试加载字体 (新增防崩溃逻辑)
+    # 2. 尝试加载字体 (带异常捕获)
     if os.path.exists(local_font):
         try:
-            # 尝试加载下载的字体
             return ImageFont.truetype(local_font, size=size)
         except OSError:
-            # ⚠️ 如果报错（说明文件损坏），删除坏文件，并返回默认字体
+            # 🚨 关键修复：如果文件损坏(OSError)，删除它，避免下次还报错
             try:
-                os.remove(local_font)  # 删掉坏文件，下次重新下载
+                os.remove(local_font)
+                print(f"检测到字体损坏，已删除: {local_font}")
             except:
                 pass
             return ImageFont.load_default()
 
-    # 3. 如果文件不存在或加载失败，使用默认字体
+    # 3. 保底方案
     return ImageFont.load_default()
 
 
@@ -84,19 +85,17 @@ def grade_with_qwen(image: Image.Image, current_max_score: int, api_key: str) ->
     你是严厉的英语阅卷老师。
     用户设定这张图片的总分值为：【{current_max_score} 分】。
 
-    图片中可能包含一道大题，也可能包含多个小题。
-
     【任务要求】
-    1. **分值权重**：以 {current_max_score} 分为满分上限。如果题目旁标有小分值，请参考该权重；若无，则按错误严重程度扣分。
+    1. **分值权重**：以 {current_max_score} 分为满分上限。
     2. **精准定位**："box"坐标必须精确框住错误的单词。
     3. **错误描述**：请指明错误类型和位置（如"Q1: 拼写错误"）。
 
     【输出 JSON】
     {{
-        "score": 整数 (最终得分),
+        "score": 整数,
         "short_comment": "简评(中文, 20字内)",
         "errors": [ 
-            {{"description": "Q1: have应为has", "box": [x1, y1, x2, y2]}}
+            {{"description": "错误说明", "box": [x1, y1, x2, y2]}}
         ],
         "analysis_md": "Markdown格式分析"
     }}
@@ -134,11 +133,13 @@ def draw_result(image: Image.Image, result: GradeResult) -> Image.Image:
     draw = ImageDraw.Draw(overlay)
     w, h = img_draw.size
 
+    # 错误高亮
     for error in result.errors:
         if len(error.box) == 4:
             x1, y1, x2, y2 = [c * (w if i % 2 == 0 else h) / 1000 for i, c in enumerate(error.box)]
             draw.rectangle([x1, y1, x2, y2], fill=(255, 0, 0, 60), outline=(255, 0, 0, 180), width=3)
 
+    # 印章绘制
     stamp_size = int(w * 0.22)
     stamp_h = int(stamp_size * 0.65)
     margin = 20
@@ -146,6 +147,7 @@ def draw_result(image: Image.Image, result: GradeResult) -> Image.Image:
 
     draw.rounded_rectangle(box_coords, radius=15, fill=(255, 255, 255, 210), outline=None)
 
+    # 这里调用 load_font 即使字体坏了也不会崩溃，而是用默认字体
     font_score = load_font(int(stamp_h * 0.6))
     font_text = load_font(int(stamp_h * 0.25))
 
@@ -165,9 +167,7 @@ def main():
     # Session 初始化
     if "page" not in st.session_state: st.session_state.page = "setup"
     if "api_key" not in st.session_state: st.session_state.api_key = ""
-    # 核心分值变量
     if "current_score_setting" not in st.session_state: st.session_state.current_score_setting = 100
-    # 锁定状态变量
     if "score_locked" not in st.session_state: st.session_state.score_locked = False
 
     # ---------------------------------------------------------
@@ -188,79 +188,51 @@ def main():
                         st.rerun()
 
     # ---------------------------------------------------------
-    # 页面 2: 拍摄页 (新增：锁定逻辑)
+    # 页面 2: 拍摄页
     # ---------------------------------------------------------
     elif st.session_state.page == "scan":
         st.markdown("""
             <style>
             header {visibility: hidden;} 
-            .main .block-container {
-                padding: 10px !important; 
-                max-width: 100%;
-            }
-            [data-testid="stCameraInput"] {
-                width: 100% !important;
-                height: 75vh !important;
-                margin-top: 5px;
-            }
-            [data-testid="stCameraInput"] video {
-                height: 100% !important;
-                object-fit: cover !important;
-                border-radius: 15px;
-            }
+            .main .block-container { padding: 10px !important; max-width: 100%; }
+            [data-testid="stCameraInput"] { width: 100% !important; height: 75vh !important; margin-top: 5px; }
+            [data-testid="stCameraInput"] video { height: 100% !important; object-fit: cover !important; border-radius: 15px; }
             .stButton button { border-radius: 25px; height: 3rem; font-weight: bold; }
-            /* 调整Toggle样式，使其更紧凑 */
-            .stCheckbox label { font-weight: bold; color: #555; }
             </style>
         """, unsafe_allow_html=True)
 
-        # --- 顶部控制区 ---
-        c1, c2, c3 = st.columns([1.2, 2, 1.2])  # 调整比例
-
+        # 顶部控制区
+        c1, c2, c3 = st.columns([1.2, 2, 1.2])
         with c1:
             st.markdown("#### 📸 拍题")
-
         with c2:
-            # 分值输入框：如果锁定状态为True，则禁用(disabled=True)
-            new_score = st.number_input(
-                "满分",
-                value=st.session_state.current_score_setting,
-                min_value=1, max_value=200, step=1,
-                label_visibility="collapsed",
-                disabled=st.session_state.score_locked,  # 关键：根据锁定状态禁用
-                key="score_input_box"
-            )
-            # 如果没锁定，实时更新Session
+            new_score = st.number_input("满分", value=st.session_state.current_score_setting,
+                                        min_value=1, max_value=200, step=1, label_visibility="collapsed",
+                                        disabled=st.session_state.score_locked)
             if not st.session_state.score_locked:
                 st.session_state.current_score_setting = new_score
-
         with c3:
-            # 锁定开关
-            is_locked = st.checkbox("🔒锁定", value=st.session_state.score_locked, key="lock_checkbox")
+            is_locked = st.checkbox("🔒锁定", value=st.session_state.score_locked)
             st.session_state.score_locked = is_locked
 
-        # 状态提示
         if st.session_state.score_locked:
-            st.caption(f"🔒 分值已锁定为 **{st.session_state.current_score_setting} 分** (批量批改模式)")
+            st.caption(f"🔒 分值已锁定为 **{st.session_state.current_score_setting} 分**")
         else:
-            st.caption(f"🔓 当前满分 **{st.session_state.current_score_setting} 分** (可随时修改)")
+            st.caption(f"🔓 当前满分 **{st.session_state.current_score_setting} 分**")
 
-        # 摄像头与相册
+        # 摄像头与上传
         shot = st.camera_input(" ", label_visibility="collapsed")
         with st.expander("🖼️ 从相册选择", expanded=False):
             upload = st.file_uploader(" ", type=["jpg", "png", "jpeg"], label_visibility="collapsed")
 
-        # 底部功能
         if st.button("⬅️ 设置 Key"):
             st.session_state.page = "setup"
             st.rerun()
 
-        # 处理逻辑
         input_img = shot if shot else upload
         if input_img:
             if "last_processed" not in st.session_state or st.session_state.last_processed != input_img.name:
                 st.session_state.last_processed = input_img.name
-                # 使用 current_score_setting，无论是否锁定，这个值都是最新的
                 with st.spinner(f"⚡ 正在批改 (满分: {st.session_state.current_score_setting})..."):
                     st.session_state.clean_image = process_image_for_ai(input_img)
                     st.session_state.page = "review"
@@ -293,10 +265,7 @@ def main():
 
         st.caption(st.session_state.grade_result.analysis_md)
 
-        # 下一题逻辑
         if st.button("📸 下一位同学 (分值不变)", type="primary", use_container_width=True):
-            # 注意：这里我们只清除图片数据，不清除 score_locked 和 current_score_setting
-            # 这样回到 Scan 页面时，锁定状态和分数依然保留
             for k in ["clean_image", "grade_result", "final_image", "last_processed", "current_img_id"]:
                 if k in st.session_state: del st.session_state[k]
             st.session_state.page = "scan"

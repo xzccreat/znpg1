@@ -10,11 +10,11 @@ import streamlit as st
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 
-# --- 1. 核心配置 ---
+# --- 1. 数据结构 ---
 @dataclass
 class ErrorItem:
     description: str
-    box: List[int]  # [x1, y1, x2, y2]
+    box: List[int]
 
 
 @dataclass
@@ -26,58 +26,32 @@ class GradeResult:
     analysis_md: str
 
 
-# --- 2. 增强型字体加载 (防乱码) ---
+# --- 2. 字体加载 (防乱码) ---
 @st.cache_resource
 def load_font(size: int):
-    """
-    三重保险加载字体：
-    1. 尝试下载稳健的开源字体 (WenQuanYi Micro Hei)
-    2. 尝试系统字体
-    3. 只有全失败才用默认
-    """
     font_url = "https://github.com/google/fonts/raw/main/ofl/notosanssc/NotoSansSC-Bold.ttf"
     local_font = "NotoSansSC-Bold.ttf"
-
-    # 方案A: 使用本地缓存或下载
     if not os.path.exists(local_font):
         try:
-            # 伪装浏览器头，防止被拦截
             headers = {'User-Agent': 'Mozilla/5.0'}
             r = requests.get(font_url, headers=headers, timeout=15)
             with open(local_font, 'wb') as f:
                 f.write(r.content)
         except:
             pass
-
     if os.path.exists(local_font):
         return ImageFont.truetype(local_font, size=size)
-
-    # 方案B: Linux 系统常见字体
-    try:
-        return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", size=size)
-    except:
-        pass
-
     return ImageFont.load_default()
 
 
-# --- 3. 图片标准化处理 (关键步骤) ---
+# --- 3. 图片处理 (坐标修正) ---
 def process_image_for_ai(image_file):
-    """
-    核心修复：解决红框乱飞问题。
-    1. 修正手机拍照的旋转信息 (EXIF)。
-    2. 统一缩放到宽度 1024px，AI 坐标基于此图，画图也基于此图。
-    """
     img = Image.open(image_file)
-    # 1. 修正旋转
-    img = ImageOps.exif_transpose(img)
-
-    # 2. 统一尺寸 (保持比例，宽度固定1024)
+    img = ImageOps.exif_transpose(img)  # 修正手机拍照旋转
     base_width = 1024
     w_percent = (base_width / float(img.size[0]))
     h_size = int((float(img.size[1]) * float(w_percent)))
     img = img.resize((base_width, h_size), Image.Resampling.LANCZOS)
-
     return img
 
 
@@ -87,35 +61,32 @@ def pil_to_base64(image: Image.Image) -> str:
     return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
 
-# --- 4. AI 批改引擎 ---
+# --- 4. AI 引擎 ---
 def grade_with_qwen(image: Image.Image, max_score: int, api_key: str) -> GradeResult:
     client = OpenAI(api_key=api_key, base_url="https://dashscope.aliyuncs.com/compatible-mode/v1")
     base64_img = pil_to_base64(image)
 
-    # Prompt 优化：要求更精准的单词级坐标
     prompt = f"""
-    你是严厉的英语老师。请批改这张作业，满分 {max_score}。
+    你是严厉的英语老师。批改这张作业，满分 {max_score}。
 
-    【重要任务】
-    1. 找出具体的拼写错误、语法错误。
-    2. "box"坐标必须尽可能精确地框住**错误的单词**，不要框整行。
-    3. 如果没有明显错误，errors 为空。
+    任务：
+    1. 找出拼写/语法错误。
+    2. "box"坐标必须精确框住错误单词。
+    3. 若无错误，errors为空。
 
-    请输出纯 JSON：
+    输出JSON：
     {{
         "score": 整数,
-        "short_comment": "20字以内简评(中文)",
-        "errors": [ 
-            {{"description": "错误说明", "box": [x1, y1, x2, y2]}} 
-        ],
-        "analysis_md": "Markdown详细解析"
+        "short_comment": "简评(中文)",
+        "errors": [ {{"description": "错误说明", "box": [x1, y1, x2, y2]}} ],
+        "analysis_md": "Markdown解析"
     }}
-    注意：box坐标基于 1000x1000 的归一化坐标系。
+    注意：box基于1000x1000坐标系。
     """
 
     try:
         completion = client.chat.completions.create(
-            model="qwen-vl-max",  # 必须用 Max，定位能力最强
+            model="qwen-vl-max",
             messages=[
                 {"role": "user", "content": [
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_img}"}},
@@ -129,90 +100,88 @@ def grade_with_qwen(image: Image.Image, max_score: int, api_key: str) -> GradeRe
         return GradeResult(
             score=int(data.get("score", 0)),
             max_score=max_score,
-            short_comment=data.get("short_comment", "批改完成"),
+            short_comment=data.get("short_comment", "已批改"),
             errors=error_list,
-            analysis_md=data.get("analysis_md", "无分析内容")
+            analysis_md=data.get("analysis_md", "")
         )
     except Exception as e:
-        return GradeResult(0, max_score, "API错误", [], f"错误: {str(e)}")
+        return GradeResult(0, max_score, "Error", [], f"错误: {str(e)}")
 
 
-# --- 5. 绘图：高亮模式 + 精致印章 ---
+# --- 5. 绘图 (高亮+印章) ---
 def draw_result(image: Image.Image, result: GradeResult) -> Image.Image:
-    # 在副本上画图
     img_draw = image.copy().convert("RGBA")
     overlay = Image.new("RGBA", img_draw.size, (255, 255, 255, 0))
     draw = ImageDraw.Draw(overlay)
     w, h = img_draw.size
 
-    # 1. 绘制错误高亮 (荧光笔风格)
+    # 荧光笔标记
     for error in result.errors:
         if len(error.box) == 4:
-            # 坐标换算
-            x1 = error.box[0] * w / 1000
-            y1 = error.box[1] * h / 1000
-            x2 = error.box[2] * w / 1000
-            y2 = error.box[3] * h / 1000
+            x1, y1, x2, y2 = [c * (w if i % 2 == 0 else h) / 1000 for i, c in enumerate(error.box)]
+            draw.rectangle([x1, y1, x2, y2], fill=(255, 0, 0, 60), outline=(255, 0, 0, 180), width=3)
 
-            # 画半透明红色填充块 (Highlighter)
-            draw.rectangle([x1, y1, x2, y2], fill=(255, 0, 0, 60), outline=(255, 0, 0, 180), width=2)
-
-    # 2. 绘制右上角印章 (极简风格)
-    stamp_size = int(w * 0.25)  # 宽度占画布 25%
-    stamp_h = int(stamp_size * 0.6)
+    # 印章
+    stamp_size = int(w * 0.22)
+    stamp_h = int(stamp_size * 0.65)
     margin = 20
-
-    # 印章背景 (圆角矩形，半透明白底，不遮挡文字)
     box_coords = [w - stamp_size - margin, margin, w - margin, margin + stamp_h]
-    draw.rounded_rectangle(box_coords, radius=15, fill=(255, 255, 255, 200), outline=None)
 
-    # 加载字体
+    draw.rounded_rectangle(box_coords, radius=15, fill=(255, 255, 255, 210), outline=None)
+
     font_score = load_font(int(stamp_h * 0.6))
     font_text = load_font(int(stamp_h * 0.25))
 
-    # 绘制分数 (鲜红色)
-    score_str = f"{result.score}"
-    draw.text((box_coords[0] + 15, box_coords[1] + 5), score_str, font=font_score, fill=(255, 50, 50, 255))
-
-    # 绘制总分 (小一点，灰色)
-    draw.text((box_coords[0] + 15 + font_score.getlength(score_str), box_coords[1] + stamp_h / 2.5),
+    draw.text((box_coords[0] + 15, box_coords[1] + 5), str(result.score), font=font_score, fill=(220, 20, 60, 255))
+    draw.text((box_coords[0] + 15 + font_score.getlength(str(result.score)), box_coords[1] + stamp_h / 2.5),
               f"/{result.max_score}", font=font_text, fill=(100, 100, 100, 255))
-
-    # 绘制评语 (如果字体加载失败，这一步可能不显示中文，但不会报错)
     draw.text((box_coords[0] + 15, box_coords[3] - stamp_h * 0.35),
-              result.short_comment[:8], font=font_text, fill=(255, 50, 50, 255))
+              result.short_comment[:8], font=font_text, fill=(220, 20, 60, 255))
 
-    # 合并图层
     return Image.alpha_composite(img_draw, overlay).convert("RGB")
 
 
-# --- 6. 界面 UI ---
+# --- 6. 主程序 ---
 def main():
-    st.set_page_config(page_title="英语批改", layout="centered", initial_sidebar_state="collapsed")
+    st.set_page_config(page_title="AI阅卷", layout="centered", initial_sidebar_state="collapsed")
 
-    # CSS 魔法：强制摄像头变大，修正样式
+    # --- CSS 暴力全屏优化 ---
     st.markdown("""
         <style>
-        /* 1. 摄像头区域极大化 */
+        /* 1. 移除顶部的大片空白，让内容直接顶到头 */
+        .main .block-container {
+            padding-top: 0rem !important;
+            padding-bottom: 0rem !important;
+            padding-left: 0.5rem !important;
+            padding-right: 0.5rem !important;
+            max-width: 100%;
+        }
+
+        /* 2. 隐藏 Header 和 Footer，极致纯净 */
+        header {visibility: hidden;}
+        footer {visibility: hidden;}
+
+        /* 3. 摄像头组件：强制全屏高度 */
         [data-testid="stCameraInput"] {
             width: 100% !important;
-            min-height: 60vh !important; /* 占据屏幕高度的60% */
+            /* 计算高度：屏幕高度减去底部的上传按钮区域，留出一点点空间 */
+            height: 85vh !important; 
+            margin-bottom: 0px !important;
         }
+
+        /* 4. 摄像头内的视频画面：强制填充，不留黑边 */
         [data-testid="stCameraInput"] video {
-            object-fit: cover !important; /* 画面填满，不留黑边 */
-            border-radius: 12px;
+            height: 100% !important;
+            width: 100% !important;
+            object-fit: cover !important; /* 关键：像原生相机一样充满 */
+            border-radius: 15px;
         }
 
-        /* 2. 按钮优化 */
+        /* 5. 拍照按钮美化：悬浮在画面下方 */
         .stButton button {
-            height: 3rem;
+            border-radius: 30px;
             font-weight: bold;
-            border-radius: 20px;
-        }
-
-        /* 3. 隐藏顶部多余空白 */
-        .block-container {
-            padding-top: 1rem;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
         }
         </style>
     """, unsafe_allow_html=True)
@@ -220,67 +189,67 @@ def main():
     if "api_key" not in st.session_state: st.session_state.api_key = ""
     if "mode" not in st.session_state: st.session_state.mode = "scan"
 
-    # 侧边栏
+    # --- 侧边栏配置 ---
     with st.sidebar:
+        st.header("⚙️ 设置")
         st.session_state.api_key = st.text_input("阿里 API Key", value=st.session_state.api_key, type="password")
-        max_score = st.slider("满分", 100, 150, 100)
+        # 需求2：改为手动输入分值
+        max_score = st.number_input("满分设定", min_value=10, max_value=200, value=100, step=1)
 
-    # 检查 Key
     if not st.session_state.api_key:
-        st.info("👈 请点击左上角箭头，输入 API Key 开始使用")
+        st.warning("请点击左上角箭头 > 打开侧边栏输入 Key")
         return
 
-    # 状态 A: 拍照
+    # --- 界面 A: 拍摄模式 ---
     if st.session_state.mode == "scan":
-        st.markdown("### 📸 拍摄作业")
+        # 需求3：直接展示巨大的摄像头，不使用 Tabs
+        shot = st.camera_input(" ", label_visibility="collapsed")
 
-        # 两个选项：大摄像头 OR 传图
-        # 注意：在手机上 file_uploader 也可以直接调起相机
-        tab1, tab2 = st.tabs(["📷 相机拍摄", "🖼️ 相册/原图"])
+        # 需求1：修复相册上传无反应 -> 使用 Expander 折叠，不干扰主界面，但点击即用
+        with st.expander("🖼️ 从相册选择图片 (点击展开)", expanded=False):
+            upload = st.file_uploader("支持 JPG/PNG", type=["jpg", "png", "jpeg"], label_visibility="collapsed")
 
-        with tab1:
-            shot = st.camera_input("点击下方按钮拍照", label_visibility="collapsed")
-
-        with tab2:
-            upload = st.file_uploader("上传清晰图片", type=["jpg", "png", "jpeg"])
-
-        # 处理图片
+        # 逻辑处理：优先用拍照，其次用上传
         input_img = shot if shot else upload
+
         if input_img:
-            with st.spinner("🤖 正在处理图片并连接 AI..."):
-                # 关键步骤：标准化图片
-                st.session_state.clean_image = process_image_for_ai(input_img)
-                st.session_state.mode = "review"
-                st.rerun()
+            # 防止重复刷新
+            if "last_processed" not in st.session_state or st.session_state.last_processed != input_img.name:
+                st.session_state.last_processed = input_img.name
+                with st.spinner("⚡ 正在上传并识别..."):
+                    st.session_state.clean_image = process_image_for_ai(input_img)
+                    st.session_state.mode = "review"
+                    st.rerun()
 
-    # 状态 B: 结果
+    # --- 界面 B: 结果模式 ---
     else:
-        st.markdown("### ✅ 批改结果")
-
-        # 懒加载：只有第一次才调用 AI
+        # 只在第一次进入时调用 API
         if "grade_result" not in st.session_state:
-            with st.status("正在识别笔迹与批改...", expanded=True):
+            with st.status("📝 AI 正在阅卷中...", expanded=True) as status:
+                st.write("正在识别笔迹...")
                 res = grade_with_qwen(st.session_state.clean_image, max_score, st.session_state.api_key)
                 st.session_state.grade_result = res
+                st.write("正在生成批注...")
                 st.session_state.final_image = draw_result(st.session_state.clean_image, res)
+                status.update(label="批改完成!", state="complete", expanded=False)
 
-        # 显示结果图
+        # 结果展示
         st.image(st.session_state.final_image, use_container_width=True)
 
-        # 显示分析文本
-        with st.expander("🔍 查看详细分析", expanded=True):
-            if not st.session_state.grade_result.errors:
-                st.success("🎉 全对！没有发现明显错误。")
-            else:
+        # 错误详情
+        if st.session_state.grade_result.errors:
+            with st.expander(f"查看 {len(st.session_state.grade_result.errors)} 处扣分详情", expanded=False):
                 for i, err in enumerate(st.session_state.grade_result.errors, 1):
-                    st.write(f"**{i}.** {err.description}")
-            st.markdown("---")
-            st.markdown(st.session_state.grade_result.analysis_md)
+                    st.error(f"**{i}.** {err.description}")
+        else:
+            st.success("🎉 全对！完美！")
 
-        # 重置按钮
-        if st.button("📸 下一位"):
+        st.caption(st.session_state.grade_result.analysis_md)
+
+        # 下一个按钮
+        if st.button("📸 下一位同学", type="primary", use_container_width=True):
             for k in list(st.session_state.keys()):
-                if k not in ["api_key", "mode"]:  # 保留 Key
+                if k not in ["api_key", "mode"]:
                     del st.session_state[k]
             st.session_state.mode = "scan"
             st.rerun()

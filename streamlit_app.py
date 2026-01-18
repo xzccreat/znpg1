@@ -63,7 +63,7 @@ def load_font(size: int):
 def process_image_for_ai(image_file):
     img = Image.open(image_file)
     img = ImageOps.exif_transpose(img)
-    base_width = 1024
+    base_width = 800
     w_percent = (base_width / float(img.size[0]))
     h_size = int((float(img.size[1]) * float(w_percent)))
     img = img.resize((base_width, h_size), Image.Resampling.LANCZOS)
@@ -72,7 +72,7 @@ def process_image_for_ai(image_file):
 
 def pil_to_base64(image: Image.Image) -> str:
     buffered = io.BytesIO()
-    image.save(buffered, format="JPEG", quality=85)
+    image.save(buffered, format="JPEG", quality=65)
     return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
 
@@ -104,7 +104,7 @@ def grade_with_qwen(image: Image.Image, current_max_score: int, api_key: str) ->
 
     try:
         completion = client.chat.completions.create(
-            model="qwen-vl-max",
+            model="qwen-vl-plus",
             messages=[
                 {"role": "user", "content": [
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_img}"}},

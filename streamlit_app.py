@@ -30,16 +30,32 @@ class GradeResult:
 def load_font(size: int):
     font_url = "https://github.com/google/fonts/raw/main/ofl/notosanssc/NotoSansSC-Bold.ttf"
     local_font = "NotoSansSC-Bold.ttf"
+
+    # 1. 如果文件不存在，尝试下载
     if not os.path.exists(local_font):
         try:
             headers = {'User-Agent': 'Mozilla/5.0'}
-            r = requests.get(font_url, headers=headers, timeout=15)
-            with open(local_font, 'wb') as f:
-                f.write(r.content)
+            r = requests.get(font_url, headers=headers, timeout=10)
+            if r.status_code == 200:
+                with open(local_font, 'wb') as f:
+                    f.write(r.content)
         except:
-            pass
+            pass  # 下载失败就忽略
+
+    # 2. 尝试加载字体 (新增防崩溃逻辑)
     if os.path.exists(local_font):
-        return ImageFont.truetype(local_font, size=size)
+        try:
+            # 尝试加载下载的字体
+            return ImageFont.truetype(local_font, size=size)
+        except OSError:
+            # ⚠️ 如果报错（说明文件损坏），删除坏文件，并返回默认字体
+            try:
+                os.remove(local_font)  # 删掉坏文件，下次重新下载
+            except:
+                pass
+            return ImageFont.load_default()
+
+    # 3. 如果文件不存在或加载失败，使用默认字体
     return ImageFont.load_default()
 
 

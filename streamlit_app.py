@@ -26,37 +26,41 @@ class GradeResult:
     analysis_md: str
 
 
-# 字体加载：仅用于显示数字，极大降低乱码概率
 @st.cache_resource
 def load_font(size: int):
-    # 依然尝试下载优质字体，为了让数字看起来好看
+    """
+    加载字体：优先下载 Google 开源字体用于显示漂亮的数字。
+    如果失败，自动回退到系统默认字体，防止报错。
+    """
     font_url = "https://github.com/google/fonts/raw/main/ofl/notosanssc/NotoSansSC-Bold.ttf"
     local_font = "NotoSansSC-Bold.ttf"
 
+    # 1. 尝试下载
     if not os.path.exists(local_font):
         try:
             headers = {'User-Agent': 'Mozilla/5.0'}
-            r = requests.get(font_url, headers=headers, timeout=5)  # 超时时间设短点，不强求
+            r = requests.get(font_url, headers=headers, timeout=3)  # 设置短超时，不阻塞
             if r.status_code == 200:
                 with open(local_font, 'wb') as f:
                     f.write(r.content)
         except:
             pass
 
+    # 2. 尝试加载
     if os.path.exists(local_font):
         try:
             return ImageFont.truetype(local_font, size=size)
         except:
             pass
 
-    # 如果下载失败，回退到默认字体（虽然丑点但能显示数字）
+    # 3. 保底
     return ImageFont.load_default()
 
 
 def process_image_for_ai(image_file):
     img = Image.open(image_file)
     img = ImageOps.exif_transpose(img)
-    # 保持适中分辨率，平衡速度与清晰度
+    # 压缩图片以加快上传速度，宽800通常足够识别手写
     base_width = 800
     w_percent = (base_width / float(img.size[0]))
     h_size = int((float(img.size[1]) * float(w_percent)))
@@ -66,7 +70,7 @@ def process_image_for_ai(image_file):
 
 def pil_to_base64(image: Image.Image) -> str:
     buffered = io.BytesIO()
-    image.save(buffered, format="JPEG", quality=65)
+    image.save(buffered, format="JPEG", quality=65)  # 质量65平衡体积与清晰度
     return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
 
@@ -75,21 +79,21 @@ def grade_with_qwen(image: Image.Image, current_max_score: int, api_key: str) ->
     client = OpenAI(api_key=api_key, base_url="https://dashscope.aliyuncs.com/compatible-mode/v1")
     base64_img = pil_to_base64(image)
 
-    # Prompt微调：虽然不画框了，但让AI找错误依然需要它在心里“定位”
+    # Prompt 升级：要求 AI 用文字描述具体位置
     prompt = f"""
     你是严厉的英语阅卷老师。
     用户设定这张图片的总分值为：【{current_max_score} 分】。
 
     【任务】
     1. 找出拼写、语法等错误。
-    2. 根据错误严重程度扣分。
+    2. **关键**：由于不在图上画框，请在 description 中明确指出错误的位置（例如：“第2行句首”、“倒数第二段”或引用上下文）。
 
     【输出 JSON】
     {{
         "score": 整数,
         "short_comment": "简评(中文)",
         "errors": [ 
-            {{"description": "错误说明(如: Q1 拼写错误)", "box": []}} 
+            {{"description": "位置+错误说明 (如: 第3行 'aple' 拼写错误)", "box": []}} 
         ],
         "analysis_md": "Markdown格式分析"
     }}
@@ -97,7 +101,7 @@ def grade_with_qwen(image: Image.Image, current_max_score: int, api_key: str) ->
 
     try:
         completion = client.chat.completions.create(
-            model="qwen-vl-plus",  # 使用 Plus 版提升速度
+            model="qwen-vl-plus",  # 速度快，性价比高
             messages=[
                 {"role": "user", "content": [
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_img}"}},
@@ -119,47 +123,44 @@ def grade_with_qwen(image: Image.Image, current_max_score: int, api_key: str) ->
         return GradeResult(0, current_max_score, "Error", [], f"错误: {str(e)}")
 
 
-# --- 3. 绘图逻辑 (极简版：无红框，只有分数印章) ---
+# --- 3. 绘图逻辑 (无红框版) ---
 def draw_result(image: Image.Image, result: GradeResult) -> Image.Image:
     img_draw = image.copy().convert("RGBA")
     overlay = Image.new("RGBA", img_draw.size, (255, 255, 255, 0))
     draw = ImageDraw.Draw(overlay)
     w, h = img_draw.size
 
-    # --- 1. 彻底移除了绘制红框的代码循环 ---
+    # --- 1. 已移除红框绘制代码 ---
 
     # --- 2. 绘制极简印章 (只显示分数) ---
-    # 印章大小自适应
-    stamp_size = int(w * 0.25)  # 占宽度的 1/4
-    stamp_h = int(stamp_size * 0.5)
+    stamp_size = int(w * 0.25)  # 印章宽度占图片1/4
+    stamp_h = int(stamp_size * 0.55)
     margin = 20
 
-    # 印章位置：右上角
+    # 位置：右上角
     box_coords = [w - stamp_size - margin, margin, w - margin, margin + stamp_h]
 
-    # 背景：半透明白色，带红色边框
-    draw.rounded_rectangle(box_coords, radius=15, fill=(255, 255, 255, 230), outline=(220, 50, 50, 255), width=4)
+    # 背景：半透明白色，带深红色边框
+    draw.rounded_rectangle(box_coords, radius=15, fill=(255, 255, 255, 235), outline=(200, 30, 30, 255), width=4)
 
-    # 字体加载
-    font_score_size = int(stamp_h * 0.7)
+    # 字体大小计算
+    font_score_size = int(stamp_h * 0.65)
     font_small_size = int(stamp_h * 0.3)
 
     font_score = load_font(font_score_size)
     font_small = load_font(font_small_size)
 
-    # 绘制分数：纯数字，不显示中文，避免乱码
     score_text = str(result.score)
     max_text = f"/{result.max_score}"
 
-    # 计算文字位置使其居中美观
-    # 分数 (红色大字)
+    # 绘制分数 (红色)
+    # 稍微调整坐标，使其视觉居中
     draw.text((box_coords[0] + 20, box_coords[1] + stamp_h * 0.1), score_text, font=font_score, fill=(220, 20, 20, 255))
 
-    # 满分 (灰色小字)
-    # 根据分数的长度，动态计算斜杠的位置
+    # 绘制满分 (灰色小字)
     offset_x = font_score.getlength(score_text) + 25
     draw.text((box_coords[0] + offset_x, box_coords[1] + stamp_h * 0.45), max_text, font=font_small,
-              fill=(100, 100, 100, 255))
+              fill=(120, 120, 120, 255))
 
     return Image.alpha_composite(img_draw, overlay).convert("RGB")
 
@@ -173,7 +174,7 @@ def main():
     if "current_score_setting" not in st.session_state: st.session_state.current_score_setting = 100
     if "score_locked" not in st.session_state: st.session_state.score_locked = False
 
-    # ------------------ 设置页 ------------------
+    # ------------------ 1. 设置页 ------------------
     if st.session_state.page == "setup":
         st.markdown("## 🤖 AI 阅卷老师")
         with st.container(border=True):
@@ -188,8 +189,9 @@ def main():
                         st.session_state.page = "scan"
                         st.rerun()
 
-    # ------------------ 拍摄页 ------------------
+    # ------------------ 2. 拍摄页 ------------------
     elif st.session_state.page == "scan":
+        # CSS 强制全屏拍摄体验
         st.markdown("""
             <style>
             header {visibility: hidden;} 
@@ -210,8 +212,8 @@ def main():
             if not st.session_state.score_locked:
                 st.session_state.current_score_setting = new_score
         with c3:
-            is_locked = st.checkbox("🔒锁定", value=st.session_state.score_locked)
-            st.session_state.score_locked = is_locked
+            # 简化锁定逻辑
+            st.session_state.score_locked = st.checkbox("🔒锁定", value=st.session_state.score_locked)
 
         if st.session_state.score_locked:
             st.caption(f"🔒 满分锁定: {st.session_state.current_score_setting}")
@@ -235,10 +237,11 @@ def main():
                     st.session_state.page = "review"
                     st.rerun()
 
-    # ------------------ 结果页 ------------------
+    # ------------------ 3. 结果页 ------------------
     elif st.session_state.page == "review":
         st.markdown("### 📝 批改结果")
 
+        # 确保不重复调用 API
         if "grade_result" not in st.session_state or st.session_state.get("current_img_id") != id(
                 st.session_state.clean_image):
             st.session_state.current_img_id = id(st.session_state.clean_image)
@@ -249,20 +252,23 @@ def main():
                 st.session_state.final_image = draw_result(st.session_state.clean_image, res)
                 status.update(label="完成!", state="complete", expanded=False)
 
-        # 展示干净的图片（只有分数印章）
+        # 1. 展示干净的带分图片
         st.image(st.session_state.final_image, use_container_width=True)
 
-        # 文字版详细扣分点
+        # 2. 展示扣分详情
         if st.session_state.grade_result.errors:
-            st.warning(f"共发现 {len(st.session_state.grade_result.errors)} 处扣分点：")
+            st.warning(f"发现 {len(st.session_state.grade_result.errors)} 处扣分点：")
             for i, err in enumerate(st.session_state.grade_result.errors, 1):
+                # 这里的 description 会包含 AI 生成的位置信息
                 st.error(f"**{i}.** {err.description}")
         else:
-            st.success("🎉 全对！没有发现扣分点。")
+            st.success("🎉 全对！完美！")
 
-        st.caption("AI点评: " + st.session_state.grade_result.short_comment)
+        st.caption("💡 简评: " + st.session_state.grade_result.short_comment)
 
+        # 3. 下一位按钮
         if st.button("📸 下一位 (分值不变)", type="primary", use_container_width=True):
+            # 清除图片缓存，保留分值设置
             for k in ["clean_image", "grade_result", "final_image", "last_processed", "current_img_id"]:
                 if k in st.session_state: del st.session_state[k]
             st.session_state.page = "scan"

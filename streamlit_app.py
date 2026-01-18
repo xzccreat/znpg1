@@ -10,7 +10,7 @@ import streamlit as st
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 
-# --- 1. 数据结构 ---
+# --- 1. 基础配置与工具 ---
 @dataclass
 class ErrorItem:
     description: str
@@ -26,7 +26,6 @@ class GradeResult:
     analysis_md: str
 
 
-# --- 2. 字体加载 (防乱码) ---
 @st.cache_resource
 def load_font(size: int):
     font_url = "https://github.com/google/fonts/raw/main/ofl/notosanssc/NotoSansSC-Bold.ttf"
@@ -44,10 +43,9 @@ def load_font(size: int):
     return ImageFont.load_default()
 
 
-# --- 3. 图片处理 (坐标修正) ---
 def process_image_for_ai(image_file):
     img = Image.open(image_file)
-    img = ImageOps.exif_transpose(img)  # 修正手机拍照旋转
+    img = ImageOps.exif_transpose(img)
     base_width = 1024
     w_percent = (base_width / float(img.size[0]))
     h_size = int((float(img.size[1]) * float(w_percent)))
@@ -61,7 +59,7 @@ def pil_to_base64(image: Image.Image) -> str:
     return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
 
-# --- 4. AI 引擎 ---
+# --- 2. AI 核心逻辑 ---
 def grade_with_qwen(image: Image.Image, max_score: int, api_key: str) -> GradeResult:
     client = OpenAI(api_key=api_key, base_url="https://dashscope.aliyuncs.com/compatible-mode/v1")
     base64_img = pil_to_base64(image)
@@ -108,20 +106,18 @@ def grade_with_qwen(image: Image.Image, max_score: int, api_key: str) -> GradeRe
         return GradeResult(0, max_score, "Error", [], f"错误: {str(e)}")
 
 
-# --- 5. 绘图 (高亮+印章) ---
+# --- 3. 绘图逻辑 ---
 def draw_result(image: Image.Image, result: GradeResult) -> Image.Image:
     img_draw = image.copy().convert("RGBA")
     overlay = Image.new("RGBA", img_draw.size, (255, 255, 255, 0))
     draw = ImageDraw.Draw(overlay)
     w, h = img_draw.size
 
-    # 荧光笔标记
     for error in result.errors:
         if len(error.box) == 4:
             x1, y1, x2, y2 = [c * (w if i % 2 == 0 else h) / 1000 for i, c in enumerate(error.box)]
             draw.rectangle([x1, y1, x2, y2], fill=(255, 0, 0, 60), outline=(255, 0, 0, 180), width=3)
 
-    # 印章
     stamp_size = int(w * 0.22)
     stamp_h = int(stamp_size * 0.65)
     margin = 20
@@ -141,104 +137,123 @@ def draw_result(image: Image.Image, result: GradeResult) -> Image.Image:
     return Image.alpha_composite(img_draw, overlay).convert("RGB")
 
 
-# --- 6. 主程序 ---
+# --- 4. 主程序流程 ---
 def main():
     st.set_page_config(page_title="AI阅卷", layout="centered", initial_sidebar_state="collapsed")
 
-    # --- CSS 暴力全屏优化 ---
-    st.markdown("""
-        <style>
-        /* 1. 移除顶部的大片空白，让内容直接顶到头 */
-        .main .block-container {
-            padding-top: 0rem !important;
-            padding-bottom: 0rem !important;
-            padding-left: 0.5rem !important;
-            padding-right: 0.5rem !important;
-            max-width: 100%;
-        }
-
-        /* 2. 隐藏 Header 和 Footer，极致纯净 */
-        header {visibility: hidden;}
-        footer {visibility: hidden;}
-
-        /* 3. 摄像头组件：强制全屏高度 */
-        [data-testid="stCameraInput"] {
-            width: 100% !important;
-            /* 计算高度：屏幕高度减去底部的上传按钮区域，留出一点点空间 */
-            height: 85vh !important; 
-            margin-bottom: 0px !important;
-        }
-
-        /* 4. 摄像头内的视频画面：强制填充，不留黑边 */
-        [data-testid="stCameraInput"] video {
-            height: 100% !important;
-            width: 100% !important;
-            object-fit: cover !important; /* 关键：像原生相机一样充满 */
-            border-radius: 15px;
-        }
-
-        /* 5. 拍照按钮美化：悬浮在画面下方 */
-        .stButton button {
-            border-radius: 30px;
-            font-weight: bold;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-        }
-        </style>
-    """, unsafe_allow_html=True)
-
+    # 初始化 Session State
+    if "page" not in st.session_state: st.session_state.page = "setup"
     if "api_key" not in st.session_state: st.session_state.api_key = ""
-    if "mode" not in st.session_state: st.session_state.mode = "scan"
+    if "max_score" not in st.session_state: st.session_state.max_score = 100
 
-    # --- 侧边栏配置 ---
-    with st.sidebar:
-        st.header("⚙️ 设置")
-        st.session_state.api_key = st.text_input("阿里 API Key", value=st.session_state.api_key, type="password")
-        # 需求2：改为手动输入分值
-        max_score = st.number_input("满分设定", min_value=10, max_value=200, value=100, step=1)
+    # ---------------------------------------------------------
+    # 页面 1: 设置页 (解决侧边栏看不到的问题)
+    # ---------------------------------------------------------
+    if st.session_state.page == "setup":
+        st.markdown("## 🤖 AI 阅卷老师")
+        st.info("首次使用，请配置以下信息：")
 
-    if not st.session_state.api_key:
-        st.warning("请点击左上角箭头 > 打开侧边栏输入 Key")
-        return
+        with st.container(border=True):
+            # 使用 form 避免每次输入都刷新，必须点按钮才提交
+            with st.form("settings_form"):
+                key_input = st.text_input("1. 输入阿里云 API Key",
+                                          value=st.session_state.api_key,
+                                          type="password",
+                                          placeholder="sk-xxxxxxxx")
 
-    # --- 界面 A: 拍摄模式 ---
-    if st.session_state.mode == "scan":
-        # 需求3：直接展示巨大的摄像头，不使用 Tabs
+                score_input = st.number_input("2. 设定试卷满分",
+                                              min_value=1, max_value=200,
+                                              value=st.session_state.max_score, step=1)
+
+                # 显眼的提交按钮
+                submitted = st.form_submit_button("🚀 确认并开始", use_container_width=True, type="primary")
+
+                if submitted:
+                    if not key_input:
+                        st.error("请输入 API Key 才能继续！")
+                    else:
+                        st.session_state.api_key = key_input
+                        st.session_state.max_score = score_input
+                        st.session_state.page = "scan"  # 切换到拍摄页
+                        st.rerun()
+
+    # ---------------------------------------------------------
+    # 页面 2: 沉浸式拍摄页 (应用暴力全屏 CSS)
+    # ---------------------------------------------------------
+    elif st.session_state.page == "scan":
+        # ⚠️ 只有在拍摄页才注入这个 CSS，防止影响设置页
+        st.markdown("""
+            <style>
+            /* 隐藏顶部Header */
+            header {visibility: hidden;} 
+            /* 移除页面边距 */
+            .main .block-container {
+                padding: 0rem !important;
+                max-width: 100%;
+            }
+            /* 摄像头全屏 */
+            [data-testid="stCameraInput"] {
+                width: 100% !important;
+                height: 85vh !important;
+                margin-bottom: 0px !important;
+            }
+            [data-testid="stCameraInput"] video {
+                height: 100% !important;
+                object-fit: cover !important;
+                border-radius: 0px 0px 20px 20px;
+            }
+            /* 底部按钮区域美化 */
+            .stButton button {
+                border-radius: 25px;
+                height: 3rem;
+                font-weight: bold;
+            }
+            </style>
+        """, unsafe_allow_html=True)
+
+        # 1. 摄像头区域
         shot = st.camera_input(" ", label_visibility="collapsed")
 
-        # 需求1：修复相册上传无反应 -> 使用 Expander 折叠，不干扰主界面，但点击即用
-        with st.expander("🖼️ 从相册选择图片 (点击展开)", expanded=False):
-            upload = st.file_uploader("支持 JPG/PNG", type=["jpg", "png", "jpeg"], label_visibility="collapsed")
+        # 2. 相册上传区域 (折叠)
+        with st.expander("🖼️ 从相册选择图片", expanded=False):
+            upload = st.file_uploader(" ", type=["jpg", "png", "jpeg"], label_visibility="collapsed")
 
-        # 逻辑处理：优先用拍照，其次用上传
+        # 3. 返回设置按钮 (放在最下面)
+        if st.button("⚙️ 修改 Key 或 分数"):
+            st.session_state.page = "setup"
+            st.rerun()
+
+        # 处理逻辑
         input_img = shot if shot else upload
-
         if input_img:
-            # 防止重复刷新
+            # 防止重复处理
             if "last_processed" not in st.session_state or st.session_state.last_processed != input_img.name:
                 st.session_state.last_processed = input_img.name
-                with st.spinner("⚡ 正在上传并识别..."):
+                with st.spinner("⚡ 正在分析..."):
                     st.session_state.clean_image = process_image_for_ai(input_img)
-                    st.session_state.mode = "review"
+                    st.session_state.page = "review"  # 切换到结果页
                     st.rerun()
 
-    # --- 界面 B: 结果模式 ---
-    else:
-        # 只在第一次进入时调用 API
-        if "grade_result" not in st.session_state:
-            with st.status("📝 AI 正在阅卷中...", expanded=True) as status:
-                st.write("正在识别笔迹...")
-                res = grade_with_qwen(st.session_state.clean_image, max_score, st.session_state.api_key)
-                st.session_state.grade_result = res
-                st.write("正在生成批注...")
-                st.session_state.final_image = draw_result(st.session_state.clean_image, res)
-                status.update(label="批改完成!", state="complete", expanded=False)
+    # ---------------------------------------------------------
+    # 页面 3: 结果页
+    # ---------------------------------------------------------
+    elif st.session_state.page == "review":
+        st.markdown("### 📝 批改结果")
 
-        # 结果展示
+        if "grade_result" not in st.session_state or st.session_state.get("current_img_id") != id(
+                st.session_state.clean_image):
+            st.session_state.current_img_id = id(st.session_state.clean_image)
+            with st.status("AI 阅卷中...", expanded=True) as status:
+                res = grade_with_qwen(st.session_state.clean_image, st.session_state.max_score,
+                                      st.session_state.api_key)
+                st.session_state.grade_result = res
+                st.session_state.final_image = draw_result(st.session_state.clean_image, res)
+                status.update(label="完成!", state="complete", expanded=False)
+
         st.image(st.session_state.final_image, use_container_width=True)
 
-        # 错误详情
         if st.session_state.grade_result.errors:
-            with st.expander(f"查看 {len(st.session_state.grade_result.errors)} 处扣分详情", expanded=False):
+            with st.expander(f"查看 {len(st.session_state.grade_result.errors)} 处扣分点", expanded=True):
                 for i, err in enumerate(st.session_state.grade_result.errors, 1):
                     st.error(f"**{i}.** {err.description}")
         else:
@@ -246,13 +261,15 @@ def main():
 
         st.caption(st.session_state.grade_result.analysis_md)
 
-        # 下一个按钮
-        if st.button("📸 下一位同学", type="primary", use_container_width=True):
-            for k in list(st.session_state.keys()):
-                if k not in ["api_key", "mode"]:
-                    del st.session_state[k]
-            st.session_state.mode = "scan"
-            st.rerun()
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            if st.button("📸 下一位", type="primary", use_container_width=True):
+                st.session_state.page = "scan"
+                st.rerun()
+        with col2:
+            if st.button("⚙️ 设置", use_container_width=True):
+                st.session_state.page = "setup"
+                st.rerun()
 
 
 if __name__ == "__main__":
